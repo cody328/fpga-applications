@@ -1,0 +1,118 @@
+name: Xilinx FPGA CI/CD Pipeline
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main ]
+
+env:
+  PROJECT_NAME: advanced_system
+  VIVADO_VERSION: 2023.2
+
+jobs:
+  lint-and-analyze:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v3
+    
+    - name: Setup Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.9'
+        
+    - name: Install dependencies
+      run: |
+        pip install verilator
+        sudo apt-get update
+        sudo apt-get install -y iverilog
+        
+    - name: Lint Verilog files
+      run: |
+        find src -name "*.v" -o -name "*.sv" | xargs verilator --lint-only
+        
+    - name: Run static analysis
+      run: |
+        chmod +x scripts/ci_pipeline.sh
+        scripts/ci_pipeline.sh static_analysis_only
+
+  build-and-test:
+    runs-on: self-hosted
+    needs: lint-and-analyze
+    if: contains(github.event.head_commit.message, '[build]') || github.event_name == 'pull_request'
+    
+    steps:
+    - uses: actions/checkout@v3
+    
+    - name: Setup build environment
+      run: |
+        chmod +x scripts/ci_pipeline.sh
+        
+    - name: Run synthesis
+      run: |
+        make synthesis
+        
+    - name: Run implementation
+      run: |
+        make implementation
+        
+    - name: Timing analysis
+      run: |
+        make timing_analysis
+        
+    - name: Generate performance dashboard
+      run: |
+        python3 scripts/performance_monitor.py \
+          --reports-dir reports \
+          --output-dir dashboard \
+          --json-output artifacts/metrics.json
+          
+    - name: Upload artifacts
+      uses: actions/upload-artifact@v3
+      with:
+        name: build-artifacts
+        path: |
+          reports/
+          dashboard/
+          artifacts/
+          
+    - name: Check timing constraints
+      run: |
+        if find reports -name "*timing*.rpt" -exec grep -l "VIOLATED" {} \; | grep -q .; then
+          echo "::error::Timing violations detected"
+          exit 1
+        fi
+
+  deploy:
+    runs-on: self-hosted
+    needs: build-and-test
+    if: github.ref == 'refs/heads/main' && success()
+    
+    steps:
+    - uses: actions/checkout@v3
+    
+    - name: Generate bitstream
+      run: |
+        make bitstream
+        
+    - name: Deploy to hardware
+      run: |
+        make program
+        
+    - name: Create release
+      uses: actions/create-release@v1
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        tag_name: v${{ github.run_number }}
+        release_name: Release v${{ github.run_number }}
+        body: |
+          Automated release from commit ${{ github.sha }}
+          
+          ## Build Metrics
+          - Synthesis: ✅ Passed
+          - Implementation: ✅ Passed  
+          - Timing: ✅ Met
+          
+        draft: false
+        prerelease: false
